@@ -1,3 +1,5 @@
+import os
+import pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -5,234 +7,309 @@ import torch.optim as optim
 from ripser import ripser
 import random
 
-# (1) Utility functions: define each "sub-rule" f in [0,1]
+# ──────────────────────────────────────────────────────────────────────────────
+# (1) Define synergy utility functions
+# ──────────────────────────────────────────────────────────────────────────────
 def f_add(a, b): return (a + b) / 2
 def f_mult(c, d): return c * d
+
 def f_thrsum(*args):
-    s = torch.zeros_like(args[0]);
+    s = torch.zeros_like(args[0])
     for x in args: s += x
     return (s > (0.5 * len(args))).float()
+
 def f_AND(a, b): return torch.min(a, b)
+
 def f_MAX(*args):
     stacked = torch.stack(args, dim=-1)
     return torch.max(stacked, dim=-1)[0]
+
 def f_XOR(*args):
     bits = [(x > 0.5).int() for x in args]
     acc = bits[0]
     for b in bits[1:]: acc = acc ^ b
     return acc.float()
+
 def f_bell(a, d, e, sigma=0.25):
-    return torch.exp(-(((a-0.5)**2+(d-0.5)**2+(e-0.5)**2)/(2*sigma*sigma)))
+    return torch.exp(-(((a - 0.5)**2 + (d - 0.5)**2 + (e - 0.5)**2) / (2 * sigma * sigma)))
+
 def f_OR(a, e): return torch.max(a, e)
 
-# (2) Generate one point cloud per class in R^6 = (A,B,C,D,E,P)
-def generate_dataset_for_class(class_idx, num_points=500):
-    A,B,C,D,E = [torch.rand(num_points) for _ in range(5)]
-    # define bar_f per class
-    if class_idx == 1:
-        bar_f = f_add(A, B)
-    elif class_idx == 2:
-        bar_f = f_mult(C, D)
-    elif class_idx == 3:
-        bar_f = (f_thrsum(A, B) + C)/2
-    elif class_idx == 4:
-        bar_f = (f_AND(A,B) + f_MAX(D,E))/2
-    elif class_idx == 5:
-        bar_f = A*B*C
-    elif class_idx == 6:
-        bar_f = f_XOR(B,C,D)
-    elif class_idx == 7:
-        bar_f = f_bell(A, D, E)
-    elif class_idx == 8:
-        bar_f = (f_add(A,B) + f_mult(B,C))/2
-    elif class_idx == 9:
-        bar_f = (f_AND(C,D) + f_XOR(A,E,torch.zeros_like(A)))/2
-    elif class_idx == 10:
-        bar_f = torch.max(torch.max(A,B), torch.max(C,D))
-    elif class_idx == 11:
-        bar_f = (f_MAX(A,B,E) + f_add(C,D))/2
-    elif class_idx == 12:
-        bar_f = (f_bell(A,D,torch.ones_like(A)*0.5) + f_AND(B,C))/2
-    elif class_idx == 13:
-        bar_f = (f_XOR(A,B,C) + f_MAX(D,E))/2
-    elif class_idx == 14:
-        bar_f = f_thrsum(B,D,E)
-    elif class_idx == 15:
-        bar_f = (f_OR(A,C) + f_OR(C,E) + f_OR(A,E))/3
-    elif class_idx == 16:
-        bar_f = A*B*C*D*E
-    elif class_idx == 17:
-        bar_f = (f_bell(A,torch.ones_like(A)*0.5,torch.ones_like(A)*0.5) + f_XOR(B,D,torch.zeros_like(B)))/2
-    elif class_idx == 18:
-        bar_f = (f_MAX(C,D) + f_thrsum(A,B,E))/2
-    elif class_idx == 19:
-        bar_f = (f_add(A,D) + f_XOR(B,C,E))/2
-    elif class_idx == 20:
-        bar_f = (torch.min(torch.min(A,C),E) + f_bell(B,D,torch.ones_like(B)*0.5))/2
-    else:
-        raise ValueError("class_idx must be 1..20")
 
-    P = 2*bar_f - 1
-    return torch.stack([A,B,C,D,E,P], dim=1).numpy()
+# ──────────────────────────────────────────────────────────────────────────────
+# (2) Select top‐5 classes and build point clouds
+# ──────────────────────────────────────────────────────────────────────────────
+selected_classes    = [5, 8, 12, 15, 16]  # original synergy‐rule indices
+num_classes         = len(selected_classes)
+datasets_per_class  = 400
 
-# (3) Build dataset
-num_classes, datasets_per_class = 20, 100
 all_pcs, all_labels = [], []
-for cls in range(1, num_classes+1):
+for new_label, cls in enumerate(selected_classes):
     for _ in range(datasets_per_class):
-        all_pcs.append(generate_dataset_for_class(cls))
-        all_labels.append(cls-1)
-all_pcs = np.array(all_pcs)
-all_labels = np.array(all_labels)
+        A, B, C, D, E = [torch.rand(500) for _ in range(5)]
+        if   cls == 5:
+            bar_f = A * B * C
+        elif cls == 8:
+            bar_f = (f_add(A, B) + f_mult(B, C)) / 2
+        elif cls == 12:
+            bar_f = (f_bell(A, D, 0.5*torch.ones_like(A)) + f_AND(B, C)) / 2
+        elif cls == 15:
+            bar_f = (f_OR(A, C) + f_OR(C, E) + f_OR(A, E)) / 3
+        elif cls == 16:
+            bar_f = A * B * C * D * E
+        else:
+            raise ValueError(f"Unexpected class {cls}")
+        P = 2 * bar_f - 1
+        all_pcs.append(torch.stack([A, B, C, D, E, P], dim=1).numpy())
+        all_labels.append(new_label)
+all_pcs    = np.array(all_pcs)    # shape (5*400, 500, 6)
+all_labels = np.array(all_labels) # shape (5*400,)
 
-# (4) Compute H0,H1,H2 diagrams transformed
 
-def compute_diagrams(pc):
-    dgms = ripser(pc, maxdim=2)['dgms']
-    return [np.array([[b, d-b] for b,d in diag if np.isfinite(d)]) for diag in dgms]
+# ──────────────────────────────────────────────────────────────────────────────
+# (3) Load & slice cached persistence diagrams
+# ──────────────────────────────────────────────────────────────────────────────
+cache_path = 'pd_cache.pkl'
+if not os.path.exists(cache_path):
+    raise FileNotFoundError(f"Cache file {cache_path} not found.")
 
-all_diagrams = [compute_diagrams(pc) for pc in all_pcs]
+with open(cache_path, 'rb') as f:
+    full_cache = pickle.load(f)
+original_per_class = len(full_cache) // 20
 
-# (5) Grid setup
+all_diagrams = []
+for cls in selected_classes:
+    base = (cls - 1) * original_per_class
+    for rep in range(datasets_per_class):
+        all_diagrams.append(full_cache[base + rep])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (4) Persistence‐image grid setup
+# ──────────────────────────────────────────────────────────────────────────────
 finite_b = np.concatenate([d[:,0] for diag in all_diagrams for d in diag if d.size])
 finite_p = np.concatenate([d[:,1] for diag in all_diagrams for d in diag if d.size])
-b_min,b_max = finite_b.min(), finite_b.max()
+b_min, b_max = finite_b.min(), finite_b.max()
 p_max = max(finite_p.max(), 1e-3)
 print(f"Bounding box → b_min={b_min:.5f}, b_max={b_max:.5f}, p_max={p_max:.5f}")
 
-grid_size=20
-b_edges=np.linspace(b_min,b_max,grid_size+1)
-p_edges=np.linspace(0,p_max,grid_size+1)
-b_centers=(b_edges[:-1]+b_edges[1:])/2
-p_centers=(p_edges[:-1]+p_edges[1:])/2
-centers=np.array([[bc,pc] for bc in b_centers for pc in p_centers])
-pixel_area=((b_max-b_min)/grid_size)*(p_max/grid_size)
+grid_size = 20
+b_edges   = np.linspace(b_min, b_max, grid_size+1)
+p_edges   = np.linspace(0, p_max,  grid_size+1)
+b_centers = (b_edges[:-1] + b_edges[1:]) / 2
+p_centers = (p_edges[:-1] + p_edges[1:]) / 2
+centers   = np.array([[bc, pc] for bc in b_centers for pc in p_centers])
+pixel_area = ((b_max - b_min)/grid_size) * (p_max/grid_size)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# (6) Separate α-nets
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (5) α‐networks & compute_persistence_image (initialized to constant=1)
+# ──────────────────────────────────────────────────────────────────────────────
+device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+centers_t = torch.tensor(centers, dtype=torch.float32, device=device)
+tau       = max(0.1 * p_max, 1e-4)
+
 class AlphaNetwork(nn.Module):
-    def __init__(self):
+    def __init__(self, init_C=1.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2,128), nn.ReLU(),
-            nn.Linear(128,128), nn.ReLU(),
-            nn.Linear(128,1), nn.Softplus()
-        )
-    def forward(self,x): return self.net(x).squeeze(-1)
+        self.layer1 = nn.Linear(2, 128)
+        self.layer2 = nn.Linear(128, 128)
+        self.output = nn.Linear(128, 1)
+        self.softplus = nn.Softplus()
+        # initialize output to constant init_C
+        bias_init = np.log(np.exp(init_C) - 1)
+        with torch.no_grad():
+            self.output.weight.zero_()
+            self.output.bias.fill_(bias_init)
 
-alpha0, alpha1, alpha2 = [AlphaNetwork().to(device) for _ in range(3)]
-centers_tensor = torch.tensor(centers, dtype=torch.float32, device=device)
-tau = max(0.1*p_max,1e-4)
+    def forward(self, x):
+        x = torch.relu(self.layer1(x))
+        x = torch.relu(self.layer2(x))
+        return self.softplus(self.output(x)).squeeze(-1)
+
+alpha0 = AlphaNetwork(init_C=1.0).to(device)
+alpha1 = AlphaNetwork(init_C=1.0).to(device)
+alpha2 = AlphaNetwork(init_C=1.0).to(device)
 
 def compute_persistence_image(dgm, alpha_net):
     if dgm.size == 0:
         return torch.zeros(grid_size*grid_size, device=device)
-    U = torch.tensor(dgm, dtype=torch.float32, device=device)
-    w = alpha_net(U)
-    diff = (U.unsqueeze(1) - centers_tensor.unsqueeze(0)).pow(2).sum(2)
-    phi = torch.exp(-diff/(2*tau*tau))/(2*np.pi*tau*tau)
-    return (w.unsqueeze(1)*phi).sum(0)*pixel_area
+    U    = torch.tensor(dgm, dtype=torch.float32, device=device)
+    w    = alpha_net(U)                       # (N,)
+    diff = (U.unsqueeze(1) - centers_t.unsqueeze(0)).pow(2).sum(2)  # (N,400)
+    phi  = torch.exp(-diff/(2*tau*tau)) / (2*np.pi*tau*tau)
+    return (w.unsqueeze(1) * phi).sum(0) * pixel_area  # (400,)
 
-# (7) CNN for 3-channel PI
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (6) CNN for 3‐channel persistence images
+# ──────────────────────────────────────────────────────────────────────────────
 class PI_CNN(nn.Module):
-    def __init__(self):
+    def __init__(self, grid_size=20):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(3,16,3,padding=1), nn.ReLU(),
-            nn.Conv2d(16,32,3,padding=1), nn.ReLU()
+            nn.Conv2d(16,32,3,padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),             # → 32×10×10
+            nn.Conv2d(32,64,3,padding=1), nn.ReLU(),
+            nn.Conv2d(64,128,3,padding=1), nn.ReLU(),
+            nn.MaxPool2d(2)              # → 128×5×5
         )
-        self.fc = nn.Linear(32*grid_size*grid_size, grid_size*grid_size)
-    def forward(self,x):
+        self.fc = nn.Linear(128*5*5, grid_size*grid_size)
+
+    def forward(self, x):
         x = self.conv(x)
-        x = x.view(x.size(0),-1)
-        return self.fc(x)
+        return self.fc(x.view(x.size(0), -1))
 
 cnn = PI_CNN().to(device)
 optimizer = optim.Adam(
-    list(alpha0.parameters())+list(alpha1.parameters())+list(alpha2.parameters())+
-    list(cnn.parameters()), lr=1e-3
+    list(alpha0.parameters()) + list(alpha1.parameters()) + list(alpha2.parameters()) +
+    list(cnn.parameters()),
+    lr=1e-4, weight_decay=1e-5
 )
 
-# (8) Split indices
-total = len(all_labels)
-indices = np.arange(total)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (7) Metric‐learning hinge–radius loss (return all four components)
+# ──────────────────────────────────────────────────────────────────────────────
+def batch_loss(P_tensor, labels):
+    device      = P_tensor.device
+    loss_within = torch.tensor(0., device=device)
+    centroids   = {}
+    margin, lambda_r = 20.0, 0.2
+
+    # (1) within‐class pull
+    for c in torch.unique(labels):
+        idxs = (labels==c).nonzero(as_tuple=True)[0]
+        P_c  = P_tensor[idxs]
+        mu   = P_c.mean(0)
+        centroids[int(c.item())] = mu
+        loss_within += ((P_c - mu)**2).sum()
+
+    # (2) between‐class push
+    loss_between = torch.tensor(0., device=device)
+    keys = list(centroids.keys())
+    for i in range(len(keys)):
+        for j in range(i+1, len(keys)):
+            d = torch.norm(centroids[keys[i]] - centroids[keys[j]])
+            loss_between += torch.relu(margin - d)**2
+
+    # (3) hinge–radius penalty
+    loss_radius = torch.tensor(0., device=device)
+    for ci in keys:
+        others  = [centroids[cj] for cj in keys if cj!=ci]
+        raw_min = min(torch.norm(centroids[ci] - o) for o in others)
+        y       = 0.5 * raw_min
+
+        idxs = (labels==ci).nonzero(as_tuple=True)[0]
+        P_c  = P_tensor[idxs]
+        dists= torch.norm(P_c - centroids[ci].unsqueeze(0), dim=1)
+        hinge= torch.relu(dists - y)
+        weight = 100.0/(raw_min**2 + 1e-6)
+        loss_radius += weight * (hinge**2).sum()
+
+    total_loss = lambda_r * loss_radius + loss_between
+    return total_loss, loss_within, loss_between, loss_radius
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (8) Training loop with per‐epoch loss summaries
+# ──────────────────────────────────────────────────────────────────────────────
+total     = len(all_labels)
+indices   = np.arange(total)
 np.random.shuffle(indices)
-n_train = int(0.8*total)
-n_val = int(0.1*total)
+n_train   = int(0.8 * total)
+n_val     = int(0.1 * total)
 train_idx = indices[:n_train]
 val_idx   = indices[n_train:n_train+n_val]
 test_idx  = indices[n_train+n_val:]
 
-# batch_loss unchanged (metric-learning hinge-radius)
-def batch_loss(P_tensor, labels):
-    # ... same as before ...
-    return total_loss, loss_within, loss_between, loss_radius
-
-# (9) Training loop
-num_epochs, batch_size = 20, 60
+num_epochs, batch_size = 100, 60
 for epoch in range(1, num_epochs+1):
     np.random.shuffle(indices)
+    epoch_within  = epoch_between = epoch_radius = 0.0
+    num_batches   = 0
+
     for i in range(0, total, batch_size):
         batch = indices[i:i+batch_size]
-        if len(batch)<2: break
+        if len(batch) < 2: break
+
         imgs, lbls = [], []
         for idx in batch:
             d0,d1,d2 = all_diagrams[idx]
-            PI0 = compute_persistence_image(d0,alpha0).view(1,grid_size,grid_size)
-            PI1 = compute_persistence_image(d1,alpha1).view(1,grid_size,grid_size)
-            PI2 = compute_persistence_image(d2,alpha2).view(1,grid_size,grid_size)
-            imgs.append(torch.cat([PI0,PI1,PI2],0))
+            PI0 = compute_persistence_image(d0, alpha0).view(1,grid_size,grid_size)
+            PI1 = compute_persistence_image(d1, alpha1).view(1,grid_size,grid_size)
+            PI2 = compute_persistence_image(d2, alpha2).view(1,grid_size,grid_size)
+            imgs.append(torch.cat([PI0,PI1,PI2], 0))
             lbls.append(all_labels[idx])
+
         imgs = torch.stack(imgs).to(device)
         lbls = torch.tensor(lbls, device=device)
-        P_vec = cnn(imgs)
-        loss, lw, lb, lr_ = batch_loss(P_vec, lbls)
-        optimizer.zero_grad(); loss.backward(); optimizer.step()
-    print(f"Epoch {epoch:02d} | Loss: {loss.item():.4f}")
 
-# (10) Evaluation metrics
+        P_vec, = cnn(imgs).unsqueeze(0),  # dummy unpack
+        total_l, lw, lb, lr = batch_loss(cnn(imgs), lbls)
+
+        optimizer.zero_grad()
+        total_l.backward()
+        torch.nn.utils.clip_grad_norm_(cnn.parameters(), 1.0)
+        optimizer.step()
+
+        epoch_within  += lw.item()
+        epoch_between += lb.item()
+        epoch_radius  += lr.item()
+        num_batches   += 1
+
+    print(f"Epoch {epoch:02d} | Within: {epoch_within/num_batches:.4f} | "
+          f"Between: {epoch_between/num_batches:.4f} | Radius: {epoch_radius/num_batches:.4f}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (9) Final evaluation metrics
+# ──────────────────────────────────────────────────────────────────────────────
 cnn.eval(); alpha0.eval(); alpha1.eval(); alpha2.eval()
-all_PIs = []
+
 with torch.no_grad():
+    all_PIs = []
     for d0,d1,d2 in all_diagrams:
-        PI0 = compute_persistence_image(d0,alpha0)
-        PI1 = compute_persistence_image(d1,alpha1)
-        PI2 = compute_persistence_image(d2,alpha2)
-        all_PIs.append(cnn(torch.stack([PI0,PI1,PI2],0).view(1,3,grid_size,grid_size)).squeeze(0).cpu().numpy())
-all_PIs = np.array(all_PIs)
+        PI0 = compute_persistence_image(d0, alpha0)
+        PI1 = compute_persistence_image(d1, alpha1)
+        PI2 = compute_persistence_image(d2, alpha2)
+        img = torch.stack([PI0,PI1,PI2],0).view(1,3,grid_size,grid_size).to(device)
+        all_PIs.append(cnn(img).cpu().numpy().squeeze(0))
+    all_PIs = np.array(all_PIs)
 
-# recompute centroids
-train_PIs = all_PIs[train_idx]
+# Recompute centroids on train set
+train_PIs  = all_PIs[train_idx]
 train_lbls = all_labels[train_idx]
-centroids = np.zeros((num_classes, grid_size*grid_size), dtype=np.float32)
+centroids  = np.zeros((num_classes, grid_size*grid_size), dtype=np.float32)
 for c in range(num_classes):
-    idxs = np.where(train_lbls==c)[0]
-    if idxs.size: centroids[c]=train_PIs[idxs].mean(0)
+    inds = np.where(train_lbls==c)[0]
+    if inds.size:
+        centroids[c] = train_PIs[inds].mean(0)
 
-# 1) fraction of 10 nearest
+# (10) Reporting
 print("\nNearest-10 fractions:")
 for c in range(num_classes):
-    dists = np.linalg.norm(all_PIs-centroids[c],axis=1)
+    dists   = np.linalg.norm(all_PIs - centroids[c], axis=1)
     nearest = np.argsort(dists)[:10]
-    frac = np.mean(all_labels[nearest]==c)
+    frac    = np.mean(all_labels[nearest] == c)
     print(f"Class {c}: {frac:.2f}")
 
-# 2) avg intra-class dist / nearest inter-centroid dist
 print("\nAvg-distance ratios:")
 for c in range(num_classes):
-    inds_c = np.where(all_labels==c)[0]
-    d_intra = np.linalg.norm(all_PIs[inds_c]-centroids[c],axis=1)
+    inds      = np.where(all_labels==c)[0]
+    d_intra   = np.linalg.norm(all_PIs[inds] - centroids[c], axis=1)
     avg_intra = d_intra.mean()
-    other_cs = np.delete(centroids,c,axis=0)
-    d_cent = np.linalg.norm(other_cs-centroids[c],axis=1)
-    nearest_cent = d_cent.min()
-    print(f"Class {c}: avg_intra={avg_intra:.4f}, nearest_cent={nearest_cent:.4f}, ratio={avg_intra/nearest_cent:.4f}")
+    other_cs  = np.delete(centroids, c, axis=0)
+    nearest_ic= np.linalg.norm(other_cs - centroids[c], axis=1).min()
+    print(f"Class {c}: ratio={avg_intra/nearest_ic:.4f}")
 
-# 3) count other-class points inside furthest intra-class
 print("\nFalse counts:")
 for c in range(num_classes):
-    furthest = d_intra.max()
-    other_inds = np.where(all_labels!=c)[0]
-    d_other = np.linalg.norm(all_PIs[other_inds]-centroids[c],axis=1)
-    count_other = np.sum(d_other<furthest)
-    print(f"Class {c}: {count_other} other-class within radius")
+    inds      = np.where(all_labels==c)[0]
+    d_intra   = np.linalg.norm(all_PIs[inds] - centroids[c], axis=1)
+    radius    = d_intra.max()
+    other_inds= np.where(all_labels!=c)[0]
+    d_other   = np.linalg.norm(all_PIs[other_inds] - centroids[c], axis=1)
+    count     = np.sum(d_other < radius)
+    print(f"Class {c}: {count} other-class within radius")
